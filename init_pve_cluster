@@ -1,0 +1,878 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# ==============================================================================
+# Script : init_pve_cluster
+# Date   : 2026-04-22
+# Version: 2.0
+# Modif  : 
+# ==============================================================================
+
+import os
+import sys
+import subprocess
+import json
+import readline
+import getpass
+import textwrap
+import ipaddress
+import argparse
+import time
+import termios
+import tty
+import base64
+
+# --- ANSI COLORS ---
+GREEN = '\033[0;32m'
+RED = '\033[0;31m'
+YELLOW = '\033[1;33m'
+CYAN = '\033[0;36m'
+NC = '\033[0m'
+
+# --- GLOBAL STATE ---
+class Node:
+    def __init__(self, ip, hostname, password, corosync_ip):
+        self.ip = ip
+        self.hostname = hostname
+        self.password = password
+        self.corosync_ip = corosync_ip
+
+nodes = []
+global_cidr_subnet = ""
+last_password = ""
+prev_c_ip = ""
+
+# --- HELPER FUNCTIONS ---
+
+def print_color(color, text, end='\n'):
+    print(f"{color}{text}{NC}", end=end, flush=True)
+
+def input_prefill(prompt, default_text=""):
+    """Replicates Bash 'read -e -i' allowing arrow-key editing."""
+    def hook():
+        readline.insert_text(str(default_text))
+        readline.redisplay()
+    readline.set_pre_input_hook(hook)
+    try:
+        result = input(prompt)
+    finally:
+        readline.set_pre_input_hook()
+    return result.strip()
+
+def tui_menu(title, options, orientation="vertical", default_idx=0):
+    """Flawless TUI Menu Engine with absolute mathematical cursor tracking."""
+    def getch():
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(sys.stdin.fileno())
+            ch = sys.stdin.read(1)
+            if ch == '\x1b':
+                ch += sys.stdin.read(2)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ch
+
+    # Strict sanitization
+    flat_options = [str(opt).replace('\n', ' ').replace('\r', '').strip() for opt in options]
+    selected = default_idx
+    sys.stdout.write("\033[?25l")  # Hide cursor
+    
+    # Exact newline tracking
+    lines_down = 1 if orientation == "horizontal" else len(flat_options)
+    
+    # Pre-allocate layout space to prevent bottom-screen pushing
+    sys.stdout.write("\n" * lines_down)
+    sys.stdout.write(f"\033[{lines_down}A")
+    sys.stdout.flush()
+    
+    try:
+        while True:
+            # Draw Title (Takes exactly 1 newline)
+            sys.stdout.write(f"\r\033[K\033[1;36m{title}\033[0m\n")
+            
+            # Draw Options (Takes 0 newlines horizontally, N-1 newlines vertically)
+            if orientation == "horizontal":
+                line = "  "
+                for i, opt in enumerate(flat_options):
+                    if i == selected: line += f"\033[1;32m> {opt} <\033[0m   "
+                    else: line += f"  {opt}     "
+                sys.stdout.write(f"\r\033[K{line}")
+            else:
+                for i, opt in enumerate(flat_options):
+                    prefix = "\033[1;32m>\033[0m" if i == selected else " "
+                    color = "\033[1;32m" if i == selected else ""
+                    reset = "\033[0m" if i == selected else ""
+                    end_char = "\n" if i < len(flat_options) - 1 else ""
+                    sys.stdout.write(f"\r\033[K  {prefix} {color}{opt}{reset}{end_char}")
+                    
+            sys.stdout.flush()
+            ch = getch()
+            
+            if orientation == "horizontal":
+                if ch == '\x1b[D': selected = (selected - 1) % len(flat_options)
+                elif ch == '\x1b[C': selected = (selected + 1) % len(flat_options)
+            else:
+                if ch == '\x1b[A': selected = (selected - 1) % len(flat_options)
+                elif ch == '\x1b[B': selected = (selected + 1) % len(flat_options)
+                
+            if ch in ('\r', '\n'):
+                # Clear menu and show final static choice
+                sys.stdout.write(f"\r\033[{lines_down}A\033[J")
+                if orientation == "horizontal":
+                    sys.stdout.write(f"\r\033[K\033[1;36m{title}\033[0m  \033[1;32m> {flat_options[selected]}\033[0m\n")
+                else:
+                    sys.stdout.write(f"\r\033[K\033[1;36m{title}\033[0m\n  \033[1;32m> {flat_options[selected]}\033[0m\n")
+                return selected
+            elif ch == '\x03':
+                raise KeyboardInterrupt
+            
+            # Reset cursor absolutely
+            sys.stdout.write(f"\r\033[{lines_down}A")
+            
+    finally:
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+
+def run_ssh(ip, password, cmd, stdin_str=None):
+    env = os.environ.copy()
+    env['SSHPASS'] = password
+    args = ['sshpass', '-e', 'ssh', '-o', 'ConnectTimeout=5', '-o', 'StrictHostKeyChecking=no', f'root@{ip}']
+    if isinstance(cmd, list): args.extend(cmd)
+    else: args.append(cmd)
+    res = subprocess.run(args, env=env, input=stdin_str, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return res.returncode, res.stdout, res.stderr
+
+def run_remote_python(ip, password, script, params=None):
+    header = f"PARAMS = {json.dumps(params)}\n" if params is not None else "PARAMS = {}\n"
+    full_script = header + textwrap.dedent(script)
+    return run_ssh(ip, password, "python3 -", stdin_str=full_script)
+
+def install_dependencies():
+    try:
+        subprocess.run(['sshpass', '-V'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        subprocess.run(['expect', '-v'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    except FileNotFoundError:
+        print_color(YELLOW, "Installing required local dependencies (sshpass, expect, jq, multipath-tools)...")
+        subprocess.run(['apt-get', 'update', '-qq'], stdout=subprocess.DEVNULL)
+        subprocess.run(['apt-get', 'install', '-yq', 'sshpass', 'expect', 'jq', 'multipath-tools'], stdout=subprocess.DEVNULL)
+
+# --- CORE NETWORKING LOGIC (PROXMOX GUI COMPLIANT) ---
+
+REMOTE_NET_WRITER = """
+import os, subprocess
+
+action = PARAMS.get("action", "")
+iface = PARAMS.get("iface", "")
+comment = PARAMS.get("comment", "")
+address = PARAMS.get("address", "")
+gateway = PARAMS.get("gateway", "")
+ports = PARAMS.get("ports", "none")
+vlan_aware = PARAMS.get("vlan_aware", "N")
+vids = PARAMS.get("vids", "2-4094")
+mtu = PARAMS.get("mtu", "")
+
+try:
+    with open('/etc/network/interfaces', 'r') as f:
+        lines = f.readlines()
+except:
+    lines = []
+
+out = []
+skip = False
+
+for line in lines:
+    s = line.strip()
+    if s.startswith('auto ') or s.startswith('iface ') or s.startswith('allow-hotplug ') or s.startswith('source '):
+        parts = s.split()
+        if len(parts) > 1 and parts[1] == iface:
+            skip = True
+            continue
+        else: skip = False
+            
+    if skip:
+        if s == "" or line.startswith(' ') or line.startswith('\\t') or s.startswith('#'): continue
+        else: skip = False
+            
+    if not skip: out.append(line)
+
+while out and out[-1].strip() == "": out.pop()
+
+if action in ["create", "modify"]:
+    out.append('\\n\\n')
+    out.append(f"auto {iface}\\n")
+    mode = "static" if address else "manual"
+    out.append(f"iface {iface} inet {mode}\\n")
+    
+    if address: out.append(f"\\taddress {address}\\n")
+    if gateway: out.append(f"\\tgateway {gateway}\\n")
+    
+    p = ports if ports else "none"
+    out.append(f"\\tbridge-ports {p}\\n")
+    out.append(f"\\tbridge-stp off\\n")
+    out.append(f"\\tbridge-fd 0\\n")
+    
+    if str(vlan_aware).lower() in ['y', 'yes', '1', 'true']:
+        out.append(f"\\tbridge-vlan-aware yes\\n")
+        out.append(f"\\tbridge-vids {vids if vids else '2-4094'}\\n")
+    if mtu: out.append(f"\\tmtu {mtu}\\n")
+    if comment: out.append(f"#{comment}\\n")
+        
+out.append('\\n')
+
+with open('/etc/network/interfaces', 'w') as f: f.writelines(out)
+
+if action == "delete":
+    subprocess.run(['ip', 'link', 'set', iface, 'down'], stderr=subprocess.DEVNULL)
+    subprocess.run(['ip', 'link', 'delete', iface, 'type', 'bridge'], stderr=subprocess.DEVNULL)
+"""
+
+def remote_network_scan(ip, password):
+    script = """
+    import os, subprocess, json, socket, re
+    
+    def extract_num(name):
+        n = ''.join(filter(str.isdigit, name))
+        return int(n) if n else 999
+
+    print("\\033[0;36mPhysical Interfaces:\\033[0m")
+    try:
+        ifaces = [f for f in os.listdir('/sys/class/net') if not re.match(r'^(lo|vmbr|tap|veth|fw|bond|vlan)', f)]
+        ifaces.sort(key=extract_num)
+        
+        for iface in ifaces:
+            subprocess.run(['ip', 'link', 'set', iface, 'up'], stderr=subprocess.DEVNULL)
+        
+        for iface in ifaces:
+            try:
+                with open(f'/sys/class/net/{iface}/carrier', 'r') as f: carrier = f.read().strip()
+            except: carrier = "0"
+            state = "\\033[0;32mConnected\\033[0m" if carrier == "1" else "\\033[0;31mDisconnected\\033[0m"
+            
+            try:
+                with open(f'/sys/class/net/{iface}/speed', 'r') as f: speed = f"{f.read().strip()} Mbps"
+            except: speed = "N/A"
+                
+            master_info = "Free"
+            if os.path.exists(f'/sys/class/net/{iface}/master'):
+                master_name = os.path.basename(os.readlink(f'/sys/class/net/{iface}/master'))
+                master_info = f"\\033[1;33mSlaved to {master_name}\\033[0m"
+                
+            print(f"  - {iface.ljust(6)} | Link: {state.ljust(21)} | Speed: {speed.ljust(10)} | Status: {master_info}")
+    except Exception as e:
+        print(f"Error reading physical interfaces: {e}")
+
+    print("\\n\\033[0;36mVirtual Bridges (vmbr):\\033[0m")
+    try:
+        node = socket.gethostname()
+        out = subprocess.check_output(['pvesh', 'get', f'/nodes/{node}/network', '--type', 'bridge', '--output-format', 'json'])
+        data = json.loads(out)
+        data.sort(key=lambda x: extract_num(x.get('iface', '')))
+        
+        for i in data:
+            name = i.get('iface', '')
+            ports = i.get('bridge_ports', 'none')
+            addr = i.get('address', '')
+            mask = i.get('netmask', '')
+            ip_str = f"{addr}/{mask}" if addr else "No IP"
+            gw = f" | GW: {i.get('gateway')}" if i.get('gateway') else ""
+            
+            comment = i.get('comments', '')
+            if not comment:
+                try:
+                    c_out = subprocess.check_output(f"grep -A 10 '^auto {name}' /etc/network/interfaces | grep '^#' | head -n 1", shell=True, text=True)
+                    comment = c_out.strip().lstrip('#').strip()
+                except: pass
+            
+            comment = str(comment).replace('\\n', ' ').replace('\\r', '').strip()
+            if not comment: comment = 'N/A'
+            print(f"  - {name.ljust(6)} | Ports: \\033[1;33m{ports.ljust(10)}\\033[0m | IP: {ip_str}{gw} | Note: \\033[0;32m{comment}\\033[0m")
+    except Exception as e:
+        print(f"API Error: {e}")
+    """
+    code, stdout, _ = run_remote_python(ip, password, script)
+    print(stdout, end="")
+
+def fetch_bridge_list(ip, password):
+    script = """
+    import subprocess, json, socket
+    try:
+        node = socket.gethostname()
+        out = subprocess.check_output(['pvesh', 'get', f'/nodes/{node}/network', '--type', 'bridge', '--output-format', 'json'])
+        data = json.loads(out)
+        def extract_num(name):
+            n = ''.join(filter(str.isdigit, name))
+            return int(n) if n else 999
+        data.sort(key=lambda x: extract_num(x.get('iface', '')))
+        res = []
+        for i in data:
+            name = i.get('iface', '')
+            addr = f"{i.get('address', '')}/{i.get('netmask', '')}" if i.get('address') else 'No IP'
+            
+            comment = i.get('comments', '')
+            if not comment:
+                try:
+                    c_out = subprocess.check_output(f"grep -A 10 '^auto {name}' /etc/network/interfaces | grep '^#' | head -n 1", shell=True, text=True)
+                    comment = c_out.strip().lstrip('#').strip()
+                except: pass
+            
+            comment = str(comment).replace('\\n', ' ').replace('\\r', '').strip()
+            if not comment: comment = 'N/A'
+            res.append({"name": name, "display": f"{name.ljust(6)} (IP: {addr.ljust(15)} Note: {comment})"})
+        print("PVE_DATA::" + json.dumps(res))
+    except Exception as e:
+        print("PVE_DATA::[]")
+    """
+    _, raw_data, _ = run_remote_python(ip, password, script)
+    try:
+        json_str = [line for line in raw_data.split('\n') if line.startswith("PVE_DATA::")][0].replace("PVE_DATA::", "")
+        return json.loads(json_str)
+    except: return []
+
+def fetch_ip_list(ip, password):
+    script = """
+    import subprocess, json, socket
+    try:
+        node = socket.gethostname()
+        out = subprocess.check_output(['pvesh', 'get', f'/nodes/{node}/network', '--output-format', 'json'])
+        data = json.loads(out)
+        
+        def extract_num(name):
+            n = ''.join(filter(str.isdigit, name))
+            return int(n) if n else 999
+            
+        data.sort(key=lambda x: extract_num(x.get('iface', '')))
+        
+        res = []
+        for i in data:
+            addr = i.get('address', '')
+            mask = i.get('netmask', '')
+            name = i.get('iface', '')
+            if addr and mask and not addr.startswith('127.'):
+                res.append({"ip": f"{addr}/{mask}", "display": f"{name.ljust(6)} | {addr}/{mask}"})
+        print("PVE_DATA::" + json.dumps(res))
+    except Exception:
+        print("PVE_DATA::[]")
+    """
+    _, raw_data, _ = run_remote_python(ip, password, script)
+    try:
+        json_str = [line for line in raw_data.split('\n') if line.startswith("PVE_DATA::")][0].replace("PVE_DATA::", "")
+        return json.loads(json_str)
+    except: return []
+
+# --- NUCLEAR ROLLBACK / RESET ---
+
+def nuclear_reset_node(ip, password, clean_net):
+    clean_cmd = "systemctl stop pve-cluster corosync 2>/dev/null || true; killall -9 pmxcfs 2>/dev/null || true; umount -l /etc/pve 2>/dev/null || true; rm -rf /var/lib/pve-cluster/config.db /var/lib/pve-cluster/.pve-lock /etc/corosync/* /var/lib/corosync/* /etc/pve/corosync.conf 2>/dev/null || true; sed -i '/PVE_CLUSTER/d' /etc/hosts; systemctl start pve-cluster 2>/dev/null || true; systemctl restart pvedaemon pveproxy 2>/dev/null || true; sleep 3"
+    run_ssh(ip, password, clean_cmd)
+    
+    if clean_net:
+        net_clean_script = f"""
+        import os, subprocess
+        ssh_ip = subprocess.check_output("echo $SSH_CONNECTION | awk '{{print $3}}'", shell=True, text=True).strip()
+        try: ssh_iface = subprocess.check_output(f"ip -o -4 addr show | grep -w '{{ssh_ip}}' | awk '{{print $2}}' | head -n 1", shell=True, text=True).strip()
+        except: ssh_iface = ""
+        try:
+            host_ip = subprocess.check_output("getent hosts $(hostname) | awk '{{print $1}}' | head -n 1", shell=True, text=True).strip()
+            host_iface = subprocess.check_output(f"ip -o -4 addr show | grep -w '{{host_ip}}' | awk '{{print $2}}' | head -n 1", shell=True, text=True).strip()
+        except: host_iface = ""
+        br_list = [f for f in os.listdir('/sys/class/net') if f.startswith('vmbr')]
+        for br in br_list:
+            if br not in [ssh_iface, host_iface, "vmbr0"]:
+                PARAMS = {{"action": "delete", "iface": br}}
+                {textwrap.indent(REMOTE_NET_WRITER, '                ')}
+        subprocess.run(['ifreload', '-a'], stderr=subprocess.DEVNULL)
+        """
+        run_remote_python(ip, password, net_clean_script)
+    subprocess.run(['ssh-keygen', '-f', os.path.expanduser('~/.ssh/known_hosts'), '-R', ip], stderr=subprocess.DEVNULL)
+
+def handle_rollback():
+    print_color(YELLOW, "\n\n⚠️  Manual Interruption (Ctrl+C) detected.")
+    choice = tui_menu("Do you really want to cancel and exit the script?", ["No, resume script", "Yes, cancel and exit"], orientation="horizontal")
+    
+    if choice == 1:
+        if nodes:
+            print_color(RED, f"Nodes have been partially configured: {[n.hostname for n in nodes]}")
+            rb_choice = tui_menu("Trigger a CASCADE ROLLBACK (Cleanup) on these nodes?", ["No, leave as is", "Yes, clean them up"], orientation="horizontal")
+            if rb_choice == 1:
+                net_choice = tui_menu("Also delete the additional virtual bridges (vmbr) created?", ["No, keep them", "Yes, delete them"], orientation="horizontal")
+                print_color(RED, "\n!!! WARNING !!!")
+                destroy = input(f"Type '{RED}DESTROY{NC}' to confirm node annihilation : ")
+                if destroy == "DESTROY":
+                    print_color(YELLOW, "Starting cascade rollback...")
+                    for node in nodes:
+                        print_color(NC, f"  -> Rollback of {node.hostname} ({node.ip})... ", end='')
+                        nuclear_reset_node(node.ip, node.password, (net_choice == 1))
+                        print_color(GREEN, "OK")
+                else:
+                    print_color(YELLOW, "Security word incorrect. Rollback aborted.")
+        print_color(RED, "Script terminated.")
+        sys.exit(1)
+    else:
+        print_color(GREEN, "Resuming script...")
+
+# --- MAIN LOGIC ---
+
+def main():
+    global global_cidr_subnet, last_password, prev_c_ip
+    
+    if os.geteuid() != 0:
+        print_color(RED, "Error: Root privileges required.")
+        sys.exit(1)
+        
+    parser = argparse.ArgumentParser(description="Proxmox Cluster Deployment Tool")
+    parser.add_argument('--clean', action='store_true', help='Destroy existing cluster')
+    args = parser.parse_args()
+
+    install_dependencies()
+    
+    if args.clean:
+        print_color(RED, "--- DEEP CLUSTER CLEANUP (PROXMOX 9) ---\n")
+        target_ip = input_prefill("Enter a cluster node IP for auto-detection (or empty for manual): ")
+        nodes_list = []
+        clean_pass = ""
+        
+        if target_ip:
+            clean_pass = getpass.getpass(f"Root password for {target_ip}: ")
+            print_color(YELLOW, f"Searching for cluster members via {target_ip}... ", end='')
+            code, out, _ = run_ssh(target_ip, clean_pass, "grep -oP '(?<=ring0_addr: ).*' /etc/pve/corosync.conf")
+            if code == 0 and out.strip():
+                print_color(GREEN, "Success")
+                for dip in out.strip().split():
+                    nodes_list.append(dip)
+                    print(f"  - Node detected: {dip}")
+            else:
+                print_color(RED, "Failed. Manual entry required.")
+                nodes_list = input_prefill("IPs to clean (space-separated): ").split()
+        else:
+            nodes_list = input_prefill("IPs to clean (space-separated): ").split()
+            
+        if not nodes_list: sys.exit(0)
+        if not clean_pass: clean_pass = getpass.getpass("Common root password: ")
+            
+        clean_net = tui_menu("Delete additional networks (excluding admin network)?", ["No, keep them", "Yes, delete them"], orientation="horizontal")
+        
+        print_color(RED, "\n!!! WARNING !!!")
+        print("You are about to DESTROY the cluster on:")
+        for nip in nodes_list: print(f"  - {nip}")
+        print("This action is completely irreversible.")
+        
+        if input(f"Type '{RED}DESTROY{NC}' to confirm execution: ") == "DESTROY":
+            for nip in nodes_list:
+                print_color(YELLOW, f"Nuclear Reset on {nip}... ", end='')
+                nuclear_reset_node(nip, clean_pass, (clean_net == 1))
+                print_color(GREEN, "OK")
+        else:
+            print_color(YELLOW, "Security word incorrect. Aborted.")
+        sys.exit(0)
+
+    os.system('clear')
+    print_color(GREEN, "--- PROXMOX CLUSTER INITIALIZATION v43.0.0-TUI-FLAWLESS ---\n")
+    node_idx = 1
+    
+    while True:
+        print_color(CYAN, "====================================================")
+        print_color(CYAN, f"           CONFIGURATION OF PVE NODE #{node_idx}    ")
+        print_color(CYAN, "====================================================")
+        
+        ip = input_prefill("PVE Management IP (leave empty to stop): ")
+        if not ip:
+            if not nodes: sys.exit(0)
+            elif len(nodes) < 2:
+                print_color(RED, "Error: A cluster requires at least 2 nodes.")
+                continue
+            else: break
+                
+        try: ipaddress.IPv4Address(ip)
+        except: print_color(RED, "Invalid IP format."); continue
+            
+        if subprocess.run(['ping', '-c', '1', '-W', '1', ip], stdout=subprocess.DEVNULL).returncode != 0:
+            print_color(RED, "IP unreachable."); continue
+            
+        if any(n.ip == ip for n in nodes):
+            print_color(RED, "Error: This IP has already been registered."); continue
+            
+        try: detected_host = subprocess.check_output(f"getent hosts {ip} | awk '{{print $2}}' | cut -d'.' -f1", shell=True, text=True).strip()
+        except: detected_host = ""
+            
+        while True:
+            host = input_prefill("Hostname for this IP: ", detected_host)
+            if not host: print_color(RED, "Required."); continue
+            if any(n.hostname == host for n in nodes): print_color(RED, "Error: Hostname already used."); continue
+            break
+            
+        while True:
+            prompt_str = "Root password (if empty, reuse previous password): " if last_password else "Root password: "
+            current_password = getpass.getpass(prompt_str) or last_password
+            code, _, _ = run_ssh(ip, current_password, "true")
+            if code == 0: break
+            else:
+                print_color(RED, "Authentication failed.")
+                last_password = ""
+
+        code, out, _ = run_ssh(ip, current_password, "[ -f /etc/pve/corosync.conf ] && echo 1 || echo 0")
+        if out.strip() == "1":
+            print_color(RED, "Existing cluster detected. Please run with --clean first.")
+            sys.exit(1)
+
+        ssh_prep = "mkdir -p /root/.ssh && echo -e 'Host *\\n\\tStrictHostKeyChecking no\\n\\tUserKnownHostsFile /dev/null' > /root/.ssh/config"
+        run_ssh(ip, current_password, ssh_prep)
+
+        while True:
+            print_color(YELLOW, f"\n--- NETWORK MANAGER : {host} ---")
+            remote_network_scan(ip, current_password)
+            
+            net_opts = [
+                "Create a virtual bridge (vmbr)",
+                "Modify an existing virtual bridge",
+                "Delete an existing virtual bridge",
+                "Validate network topology and continue"
+            ]
+            
+            print() # Gap to breathe
+            net_choice = tui_menu("Select an action:", net_opts)
+                
+            if net_choice == 0:
+                print_color(CYAN, "\n  [Create Bridge]")
+                _, next_v, _ = run_ssh(ip, current_password, "ls /sys/class/net | grep -oP '^vmbr\\K\\d+' | sort -n | tail -1 || echo -1")
+                next_v = int(next_v.strip()) + 1 if next_v.strip() else 0
+                
+                new_vmbr = input_prefill("  Bridge name : ", f"vmbr{next_v}")
+                br_comment = input_prefill("  Description/Comment (e.g., iSCSI Network) : ").replace('"', '')
+                phys_iface = input_prefill("  Interface(s) (Space or comma) : ").replace(',', ' ').strip()
+                
+                print()
+                br_vlan_opt = tui_menu("  VLAN aware?", ["No", "Yes"], orientation="horizontal")
+                br_vlan = "Y" if br_vlan_opt == 1 else "N"
+                br_vids = "2-4094"
+                if br_vlan == "Y":
+                    br_vids = input_prefill("  Allowed VLAN(s) (e.g., 10 or 2-4094) : ", "2-4094")
+                    
+                br_mtu = input_prefill("  MTU (empty = 1500) : ")
+                
+                while True:
+                    new_cidr = input_prefill("  IP/CIDR (e.g., 10.10.10.11/24, empty = manual) : ")
+                    if not new_cidr: break
+                    try:
+                        chk_ip = new_cidr.split('/')[0]
+                        ipaddress.IPv4Address(chk_ip)
+                        code, out, _ = run_ssh(ip, current_password, f"ip -o -4 addr show | grep -q ' {chk_ip}/' && echo 1 || echo 0")
+                        if out.strip() == "1":
+                            print_color(RED, "IP already in use."); continue
+                        break
+                    except: print_color(RED, "Invalid format.")
+                
+                print_color(NC, "  -> Deploying GUI compliant configuration... ", end='')
+                params = {"action": "create", "iface": new_vmbr, "comment": br_comment, "address": new_cidr, "gateway": "", "ports": phys_iface, "vlan_aware": br_vlan, "vids": br_vids, "mtu": br_mtu}
+                run_remote_python(ip, current_password, REMOTE_NET_WRITER, params)
+                run_ssh(ip, current_password, "ifreload -a > /dev/null 2>&1")
+                print_color(GREEN, "Done.")
+
+            elif net_choice == 1:
+                print_color(CYAN, "\n  [Modify Bridge]")
+                bridges = fetch_bridge_list(ip, current_password)
+                if not bridges:
+                    print_color(YELLOW, "  No bridges found to modify."); continue
+                
+                opts = [b["display"] for b in bridges] + ["Cancel"]
+                print()
+                br_idx = tui_menu("  Select a bridge to modify:", opts)
+                if br_idx == len(bridges): continue
+                
+                mod_vmbr = bridges[br_idx]["name"]
+                fetch_script = f"""
+                import subprocess, json, socket
+                try:
+                    node = socket.gethostname()
+                    out = subprocess.check_output(['pvesh', 'get', f'/nodes/{{node}}/network/{mod_vmbr}', '--output-format', 'json'])
+                    d = json.loads(out)
+                    comment = d.get('comments', '')
+                    if not comment:
+                        try:
+                            c_out = subprocess.check_output(f"grep -A 10 '^auto {mod_vmbr}' /etc/network/interfaces | grep '^#' | head -n 1", shell=True, text=True)
+                            comment = c_out.strip().lstrip('#').strip()
+                        except: pass
+                    
+                    comment = str(comment).replace('\\n', ' ').replace('\\r', '').strip()
+                    res = {{
+                        "comment": comment,
+                        "cidr": f"{{d.get('address', '')}}/{{d.get('netmask', '')}}" if d.get('address') else "",
+                        "ports": d.get('bridge_ports', ''),
+                        "vlan": 'Y' if d.get('bridge_vlan_aware') else 'N',
+                        "mtu": d.get('mtu', ''),
+                        "vids": d.get('bridge_vids', '2-4094'),
+                        "gw": d.get('gateway', '')
+                    }}
+                    print("PVE_DATA::" + json.dumps(res))
+                except: print("PVE_DATA::{{}}")
+                """
+                _, raw_data, _ = run_remote_python(ip, current_password, fetch_script)
+                try:
+                    json_str = [line for line in raw_data.split('\n') if line.startswith("PVE_DATA::")][0].replace("PVE_DATA::", "")
+                    d = json.loads(json_str)
+                except: d = {}
+
+                new_comment = input_prefill("  Description/Comment : ", d.get('comment', '')).replace('"', '')
+                new_ports = input_prefill("  Interface(s) : ", d.get('ports', '')).replace(',', ' ').strip()
+                
+                print()
+                def_vlan_idx = 1 if d.get('vlan') == 'Y' else 0
+                new_vlan_opt = tui_menu("  VLAN aware?", ["No", "Yes"], orientation="horizontal", default_idx=def_vlan_idx)
+                new_vlan = "Y" if new_vlan_opt == 1 else "N"
+                
+                new_vids = d.get('vids', '2-4094')
+                if new_vlan == "Y":
+                    new_vids = input_prefill("  Allowed VLAN(s) : ", new_vids)
+                    
+                new_mtu = input_prefill("  MTU (empty = 1500) : ", str(d.get('mtu', '')))
+                new_cidr = input_prefill("  IP/CIDR (empty = manual) : ", d.get('cidr', ''))
+                
+                new_gw = d.get('gw', '')
+                if new_gw:
+                    new_gw = input_prefill("  Gateway : ", new_gw)
+                    
+                print_color(NC, "  -> Perfect atomic file update... ", end='')
+                params = {"action": "modify", "iface": mod_vmbr, "comment": new_comment, "address": new_cidr, "gateway": new_gw, "ports": new_ports, "vlan_aware": new_vlan, "vids": new_vids, "mtu": new_mtu}
+                run_remote_python(ip, current_password, REMOTE_NET_WRITER, params)
+                run_ssh(ip, current_password, "ifreload -a > /dev/null 2>&1")
+                print_color(GREEN, "Done.")
+
+            elif net_choice == 2:
+                print_color(CYAN, "\n  [Delete Bridge]")
+                bridges = fetch_bridge_list(ip, current_password)
+                if not bridges:
+                    print_color(YELLOW, "  No bridges found to delete."); continue
+                
+                opts = [b["display"] for b in bridges] + ["Cancel"]
+                print()
+                br_idx = tui_menu("  Select a bridge to delete:", opts)
+                if br_idx == len(bridges): continue
+                
+                br_to_del = bridges[br_idx]["name"]
+                _, mgt_iface_raw, _ = run_ssh(ip, current_password, f"ip -o -4 addr show | grep -w '{ip}' | awk '{{print $2}}' | head -n 1")
+                mgt_iface = mgt_iface_raw.strip()
+                if br_to_del == mgt_iface:
+                    print_color(RED, f"Action blocked: {br_to_del} carries the active management IP ({ip}). Deleting it would sever the connection.")
+                else:
+                    print_color(NC, f"  -> Destroying {br_to_del}... ", end='')
+                    params = {"action": "delete", "iface": br_to_del}
+                    run_remote_python(ip, current_password, REMOTE_NET_WRITER, params)
+                    print_color(GREEN, "Done.")
+
+            elif net_choice == 3:
+                break
+
+        print_color(YELLOW, f"\n  Corosync Role Assignment for {host}")
+        ip_list = fetch_ip_list(ip, current_password)
+        if not ip_list:
+            print_color(RED, "Fatal: No IPs found on the server.")
+            sys.exit(1)
+
+        opts = [i["display"] for i in ip_list] + ["Manual Entry"]
+        def_idx = 0
+        
+        if not global_cidr_subnet:
+            print()
+            c_idx = tui_menu("Select Corosync IP:", opts)
+            if c_idx == len(ip_list):
+                c_input = input_prefill("  Enter Corosync IP : ", ip)
+                c_ip = c_input.split('/')[0]
+                matched_cidr = next((i["ip"] for i in ip_list if i["ip"].startswith(f"{c_ip}/")), None)
+                if not matched_cidr:
+                    print_color(RED, "IP not assigned locally. Assuming /24 subnet.")
+                    global_cidr_subnet = str(ipaddress.ip_interface(f"{c_ip}/24").network)
+                else: global_cidr_subnet = str(ipaddress.ip_interface(matched_cidr).network)
+            else:
+                c_ip = ip_list[c_idx]["ip"].split('/')[0]
+                global_cidr_subnet = str(ipaddress.ip_interface(ip_list[c_idx]["ip"]).network)
+        else:
+            for i, item in enumerate(ip_list):
+                try:
+                    if ipaddress.ip_interface(item["ip"]).network == ipaddress.ip_network(global_cidr_subnet):
+                        def_idx = i
+                        break
+                except: pass
+                
+            suggested_ip = str(ipaddress.IPv4Address(prev_c_ip) + 1) if prev_c_ip else ""
+            print(f"  Expected cluster network: {global_cidr_subnet}")
+            
+            print()
+            c_idx = tui_menu("Select Corosync IP:", opts, default_idx=def_idx)
+            if c_idx == len(ip_list):
+                c_input = input_prefill("  Enter Corosync IP : ", suggested_ip)
+                c_ip = c_input.split('/')[0]
+            else:
+                c_ip = ip_list[c_idx]["ip"].split('/')[0]
+
+        prev_c_ip = c_ip
+        nodes.append(Node(ip, host, current_password, c_ip))
+        last_password = current_password
+        node_idx += 1
+
+    print_color(CYAN, "\n====================================================")
+    while True:
+        cluster_name = input_prefill("Cluster Name (e.g., datacenter1) : ")
+        if not cluster_name: print_color(RED, "Required.")
+        elif not cluster_name.replace('_', '').replace('-', '').isalnum(): print_color(RED, "Alphanumeric only.")
+        else: break
+
+    first_node = nodes[0]
+
+    print_color(YELLOW, "\n[1/7] Corosync Full-Mesh Connectivity Test...")
+    all_ok = True
+    for i, source in enumerate(nodes):
+        for j, target in enumerate(nodes):
+            if i != j:
+                print_color(NC, f"  -> Ping: {source.hostname} -> {target.corosync_ip} ... ", end='')
+                code, _, _ = run_ssh(source.ip, source.password, f"ping -c 1 -W 2 {target.corosync_ip}")
+                if code == 0: print_color(GREEN, "OK")
+                else: print_color(RED, "FAILED"); all_ok = False
+                    
+    if not all_ok:
+        print_color(RED, "Network not routable. (Ctrl+C for Rollback)")
+        sys.exit(1)
+
+    print_color(YELLOW, "\n[2/7] Repositories and dependencies...")
+    repo_script = """
+    export DEBIAN_FRONTEND=noninteractive
+    rm -f /etc/apt/sources.list.d/pve-enterprise.* /etc/apt/sources.list.d/ceph.* 2>/dev/null || true
+    sed -i '/enterprise.proxmox.com/d' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
+    CODENAME=$(grep "VERSION_CODENAME=" /etc/os-release | cut -d'=' -f2 || echo "trixie")
+    echo "deb http://download.proxmox.com/debian/pve $CODENAME pve-no-subscription" > /etc/apt/sources.list.d/pve-no-subscription.list
+    apt-get update -qq > /dev/null
+    apt-get install -yq expect jq multipath-tools > /dev/null
+    """
+    
+    for node in nodes:
+        print_color(NC, f"  -> Configuring {node.hostname}... ", end='')
+        run_ssh(node.ip, node.password, "systemctl start pve-cluster 2>/dev/null || true")
+        run_ssh(node.ip, node.password, repo_script)
+        for target in nodes: run_ssh(node.ip, node.password, f"sed -i '/{target.ip}/d' /etc/hosts")
+        hosts_injection = "\n".join([f"echo '{n.ip} {n.hostname} # PVE_CLUSTER' >> /etc/hosts" for n in nodes])
+        run_ssh(node.ip, node.password, hosts_injection)
+        print_color(GREEN, "OK")
+
+    print_color(YELLOW, f"\n[3/7] Creating cluster '{cluster_name}'... ", end='')
+    run_ssh(first_node.ip, first_node.password, f"pvecm create {cluster_name} --link0 {first_node.corosync_ip}")
+    print_color(GREEN, "OK")
+
+    print_color(YELLOW, "\n[4/7] Joining nodes to cluster...")
+    for node in nodes[1:]:
+        print_color(NC, f"  -> Integrating {node.hostname}... ", end='')
+        reset_cmd = "systemctl stop pve-cluster corosync 2>/dev/null || true; killall -9 pmxcfs 2>/dev/null || true; umount -l /etc/pve 2>/dev/null || true; rm -rf /var/lib/pve-cluster/config.db /var/lib/pve-cluster/.pve-lock 2>/dev/null || true; rm -rf /etc/corosync/* /var/lib/corosync/* /etc/pve/corosync.conf 2>/dev/null || true; systemctl start pve-cluster; sleep 3"
+        run_ssh(node.ip, node.password, reset_cmd)
+        
+        safe_master_pass = first_node.password.replace("'", "'\\''")
+        expect_script = textwrap.dedent(f"""
+        set timeout 120
+        set master_pass $env(MASTER_PASS)
+        spawn pvecm add {first_node.ip} -link0 {node.corosync_ip}
+        expect {{
+            -re ".*(yes/no).*\\\\?" {{ send "yes\\r"; exp_continue }}
+            -re "(?i)password.*:" {{ send "$master_pass\\r"; exp_continue }}
+            eof
+        }}
+        catch wait result
+        exit [lindex $result 3]
+        """)
+        
+        b64_expect = base64.b64encode(expect_script.encode()).decode()
+        join_cmd = f"export MASTER_PASS='{safe_master_pass}'; echo '{b64_expect}' | base64 -d | expect"
+        
+        code, out, err = run_ssh(node.ip, node.password, join_cmd)
+        
+        if code == 0:
+            print_color(GREEN, "Success")
+        else:
+            print_color(RED, "FAILED")
+            print_color(YELLOW, "--- Error Logs ---")
+            print(out)
+            print(err)
+            sys.exit(1)
+
+    print_color(YELLOW, "\n[5/7] QDevice Configuration...")
+    if len(nodes) == 2:
+        qip = input_prefill("  QDevice IP (Empty to skip) : ")
+        if qip:
+            while True:
+                qpass = getpass.getpass("  QDevice Root Password : ")
+                if not qpass: print_color(RED, "Password required."); continue
+                break
+                
+            for node in nodes:
+                run_ssh(node.ip, node.password, "export DEBIAN_FRONTEND=noninteractive; apt-get install -yq corosync-qdevice > /dev/null")
+                
+            expect_qdev = textwrap.dedent(f"""
+            set timeout 120
+            set qpass $env(QPASS)
+            spawn pvecm qdevice setup {qip} -force
+            expect {{
+                ".*yes/no.*" {{ send "yes\\r"; exp_continue }}
+                "(?i)password.*:" {{ send "$qpass\\r"; exp_continue }}
+                eof
+            }}
+            """)
+            safe_qpass = qpass.replace("'", "'\\''")
+            b64_qdev = base64.b64encode(expect_qdev.encode()).decode()
+            qdev_cmd = f"export QPASS='{safe_qpass}'; echo '{b64_qdev}' | base64 -d | expect"
+            
+            run_ssh(first_node.ip, first_node.password, qdev_cmd)
+            print_color(GREEN, "  -> QDevice registered successfully.")
+    else:
+        print("  Not required (More than 2 nodes detected).")
+
+    print_color(YELLOW, "\n[6/7] Global Datacenter Options...")
+    _, current_mig, _ = run_ssh(first_node.ip, first_node.password, "grep -oP '(?<=^migration: ).*' /etc/pve/datacenter.cfg 2>/dev/null || echo 'Default'")
+    
+    mig_options = ["Keep current"]
+    if global_cidr_subnet: mig_options.append(f"Dedicated Corosync Network ({global_cidr_subnet})")
+    mig_options.append("Manual Entry (CIDR)")
+    
+    print()
+    mig_choice_idx = tui_menu(f"Migration Network [Current: {current_mig.strip()}] :", mig_options)
+    
+    if mig_options[mig_choice_idx].startswith("Dedicated"):
+        run_ssh(first_node.ip, first_node.password, f"pvesh set /cluster/options -migration type=secure,network={global_cidr_subnet}")
+    elif mig_options[mig_choice_idx].startswith("Manual"):
+        custom_mig = input_prefill("    CIDR : ")
+        run_ssh(first_node.ip, first_node.password, f"pvesh set /cluster/options -migration type=secure,network={custom_mig}")
+
+    _, current_ha, _ = run_ssh(first_node.ip, first_node.password, "grep -oP '(?<=^ha: ).*' /etc/pve/datacenter.cfg 2>/dev/null || echo 'Default (conditional)'")
+    ha_opts = [
+        "Keep current configuration",
+        "conditional (Migrate if available, else freeze)",
+        "migrate     (Force migration on shutdown)",
+        "freeze      (Leave VMs/CTs in place)",
+        "failover    (Hard stop and restart elsewhere)"
+    ]
+    
+    print()
+    ha_choice = tui_menu(f"HA Strategy [Current: {current_ha.strip()}] :", ha_opts)
+    
+    if ha_choice != 0:
+        policies = ["", "conditional", "migrate", "freeze", "failover"]
+        sel_policy = policies[ha_choice]
+        run_ssh(first_node.ip, first_node.password, f"pvesh set /cluster/options -ha shutdown_policy={sel_policy}")
+        print_color(GREEN, f"    -> Applied: {sel_policy}")
+
+    print_color(YELLOW, "\n[7/7] Asynchronous System Updates (screen)...")
+    print()
+    do_update = tui_menu("Launch dist-upgrade across all nodes?", ["No, skip", "Yes, start updates"], orientation="horizontal")
+    if do_update == 1:
+        for node in nodes:
+            run_ssh(node.ip, node.password, "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq > /dev/null && apt-get install -yq screen > /dev/null")
+            update_cmd = "export DEBIAN_FRONTEND=noninteractive; echo '--- UPGRADE START ---' > /root/pve_update.log; apt-get dist-upgrade -y >> /root/pve_update.log 2>&1; echo '--- FINISHED ---' >> /root/pve_update.log; exec bash"
+            run_ssh(node.ip, node.password, f"screen -dmS pve_upgrade bash -c \"{update_cmd}\"")
+        print_color(CYAN, "  Tracking: login to nodes and type 'screen -r pve_upgrade'")
+
+    print_color(GREEN, "\nCLUSTER INITIALIZATION COMPLETED SUCCESSFULLY!")
+    _, status, _ = run_ssh(first_node.ip, first_node.password, "pvecm status")
+    for line in status.split('\n'):
+        if any(kw in line for kw in ["Quorum", "Nodes", "Name", "Node IP"]):
+            print(line)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        handle_rollback()
